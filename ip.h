@@ -8,6 +8,11 @@
 #include <array>
 #include <format>
 #include <bit>
+#include <functional>
+#include <memory>
+#include <type_traits>
+#include <utility>
+#include <variant>
 #include <istream>
 #include <ostream>
 #include <string>
@@ -311,7 +316,8 @@ namespace Yc
             unsigned char addr[4]{};
             static constexpr uint_least32_t ipv4_to_u32(ipv4_address_t ip)noexcept
             {
-                return ip.addr[0] * 256 * 256 * 256 + ip.addr[1] * 256 * 256 + ip.addr[2] * 256 + ip.addr[3];
+                return ((uint_least32_t)ip.addr[0] << 24) | ((uint_least32_t)ip.addr[1] << 16) |
+                    ((uint_least32_t)ip.addr[2] << 8) | (uint_least32_t)ip.addr[3];
             }
             static constexpr ipv4_address_t u32_to_ipv4(uint_least32_t v)noexcept
             {
@@ -1233,7 +1239,8 @@ namespace Yc
                 compress_at = 0;
                 if (p >= last)
                 {
-                    goto done;
+                    value = ipv6_address_t{};
+                    return { p, {} };
                 }
             }
 
@@ -1280,7 +1287,6 @@ namespace Yc
                 }
             }
 
-        done:
             if (compress_at == -1 && group_count != 8)
             {
                 return { first, std::errc::invalid_argument };
@@ -1317,6 +1323,732 @@ namespace Yc
             value = ipv6_address_t{ addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
                 addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15] };
             return { p, {} };
+        }
+
+        namespace detail
+        {
+            constexpr std::from_chars_result from_chars_port(const char* first, const char* last, port_t& value)noexcept
+            {
+                unsigned int port = 0;
+                const char* p = first;
+                while (p != last && *p >= '0' && *p <= '9')
+                {
+                    port = port * 10 + (unsigned int)(*p - '0');
+                    if (port > 65535)
+                    {
+                        return { first, std::errc::invalid_argument };
+                    }
+                    ++p;
+                }
+                if (p == first)
+                {
+                    return { first, std::errc::invalid_argument };
+                }
+                value = (port_t)port;
+                return { p, {} };
+            }
+        }
+
+        // ip 地址和端口号组成的有序对，字符串形式为 "a.b.c.d:port"
+        struct ipv4_endpoint
+        {
+            ipv4_address_t address;
+            port_t port{};
+
+            constexpr ipv4_endpoint() = default;
+            constexpr ipv4_endpoint(const ipv4_endpoint&) = default;
+            constexpr ipv4_endpoint& operator=(const ipv4_endpoint&) = default;
+            constexpr ipv4_endpoint(ipv4_address_t addr, port_t port_number)noexcept
+                : address(addr), port(port_number)
+            {
+            }
+            constexpr ipv4_endpoint(std::string_view str);
+
+            friend constexpr bool operator==(ipv4_endpoint, ipv4_endpoint) = default;
+
+            friend constexpr auto operator<=>(ipv4_endpoint l, ipv4_endpoint r)noexcept
+            {
+                if (auto cmp = l.address <=> r.address; cmp != 0)
+                {
+                    return cmp;
+                }
+                return (uint_least16_t)l.port <=> (uint_least16_t)r.port;
+            }
+        };
+
+        // ipv6 地址需要用方括号括起来，字符串形式为 "[ipv6]:port"
+        struct ipv6_endpoint
+        {
+            ipv6_address_t address;
+            port_t port{};
+
+            constexpr ipv6_endpoint() = default;
+            constexpr ipv6_endpoint(const ipv6_endpoint&) = default;
+            constexpr ipv6_endpoint& operator=(const ipv6_endpoint&) = default;
+            constexpr ipv6_endpoint(ipv6_address_t addr, port_t port_number)noexcept
+                : address(addr), port(port_number)
+            {
+            }
+            constexpr ipv6_endpoint(std::string_view str);
+
+            friend constexpr bool operator==(ipv6_endpoint, ipv6_endpoint) = default;
+
+            friend constexpr auto operator<=>(ipv6_endpoint l, ipv6_endpoint r)noexcept
+            {
+                if (auto cmp = l.address <=> r.address; cmp != 0)
+                {
+                    return cmp;
+                }
+                return (uint_least16_t)l.port <=> (uint_least16_t)r.port;
+            }
+        };
+
+        constexpr std::from_chars_result from_chars(const char* first, const char* last, ipv4_endpoint& value)noexcept
+        {
+            ipv4_address_t addr{};
+            auto ar = net::from_chars(first, last, addr);
+            if (ar.ec != std::errc{})
+            {
+                return { first, ar.ec };
+            }
+            if (ar.ptr == last || *ar.ptr != ':')
+            {
+                return { first, std::errc::invalid_argument };
+            }
+            port_t port{};
+            auto pr = detail::from_chars_port(ar.ptr + 1, last, port);
+            if (pr.ec != std::errc{})
+            {
+                return { first, std::errc::invalid_argument };
+            }
+            value = ipv4_endpoint{ addr, port };
+            return { pr.ptr, {} };
+        }
+
+        constexpr std::from_chars_result from_chars(const char* first, const char* last, ipv6_endpoint& value)noexcept
+        {
+            if (first == last || *first != '[')
+            {
+                return { first, std::errc::invalid_argument };
+            }
+            const char* addr_last = std::find(first + 1, last, ']');
+            if (addr_last == last)
+            {
+                return { first, std::errc::invalid_argument };
+            }
+            ipv6_address_t addr{};
+            auto ar = net::from_chars(first + 1, addr_last, addr);
+            if (ar.ec != std::errc{} || ar.ptr != addr_last)
+            {
+                return { first, std::errc::invalid_argument };
+            }
+            if (addr_last + 1 == last || addr_last[1] != ':')
+            {
+                return { first, std::errc::invalid_argument };
+            }
+            port_t port{};
+            auto pr = detail::from_chars_port(addr_last + 2, last, port);
+            if (pr.ec != std::errc{})
+            {
+                return { first, std::errc::invalid_argument };
+            }
+            value = ipv6_endpoint{ addr, port };
+            return { pr.ptr, {} };
+        }
+
+        constexpr std::to_chars_result to_chars(char* first, char* last, ipv4_endpoint value)noexcept
+        {
+            char buffer[24]{};
+            char* const end = buffer + sizeof(buffer);
+            auto [aptr, aec] = net::to_chars(buffer, end, value.address);
+            if (aec != std::errc{})
+            {
+                return { last, std::errc::result_out_of_range };
+            }
+            *aptr++ = ':';
+            auto [pptr, pec] = std::to_chars(aptr, end, (unsigned int)(uint_least16_t)value.port);
+            if (pec != std::errc{})
+            {
+                return { last, std::errc::result_out_of_range };
+            }
+            if (last - first < pptr - buffer)
+            {
+                return { last, std::errc::result_out_of_range };
+            }
+            return { std::copy(buffer, pptr, first), {} };
+        }
+
+        constexpr std::to_chars_result to_chars(char* first, char* last, ipv6_endpoint value)noexcept
+        {
+            char buffer[48]{};
+            char* const end = buffer + sizeof(buffer);
+            buffer[0] = '[';
+            auto [aptr, aec] = net::to_chars(buffer + 1, end - 7, value.address);
+            if (aec != std::errc{})
+            {
+                return { last, std::errc::result_out_of_range };
+            }
+            *aptr++ = ']';
+            *aptr++ = ':';
+            auto [pptr, pec] = std::to_chars(aptr, end, (unsigned int)(uint_least16_t)value.port);
+            if (pec != std::errc{})
+            {
+                return { last, std::errc::result_out_of_range };
+            }
+            if (last - first < pptr - buffer)
+            {
+                return { last, std::errc::result_out_of_range };
+            }
+            return { std::copy(buffer, pptr, first), {} };
+        }
+
+        constexpr ipv4_endpoint::ipv4_endpoint(std::string_view str)
+        {
+            auto r = from_chars(str.data(), str.data() + str.size(), *this);
+            if (r.ec != std::errc{} || r.ptr != str.data() + str.size())
+            {
+                throw std::invalid_argument{ "parse ipv4 endpoint str failed!" };
+            }
+        }
+
+        constexpr ipv6_endpoint::ipv6_endpoint(std::string_view str)
+        {
+            auto r = from_chars(str.data(), str.data() + str.size(), *this);
+            if (r.ec != std::errc{} || r.ptr != str.data() + str.size())
+            {
+                throw std::invalid_argument{ "parse ipv6 endpoint str failed!" };
+            }
+        }
+
+        inline std::ostream& operator<<(std::ostream& os, ipv4_endpoint value)
+        {
+            char buffer[24]{};
+            to_chars(buffer, buffer + sizeof(buffer), value);
+            return os << buffer;
+        }
+
+        inline std::ostream& operator<<(std::ostream& os, ipv6_endpoint value)
+        {
+            char buffer[48]{};
+            to_chars(buffer, buffer + sizeof(buffer), value);
+            return os << buffer;
+        }
+
+        namespace detail
+        {
+            template<size_t I>
+            struct ip_alternative
+            {
+                static_assert(I < 2, "ip_address alternative index out of range");
+            };
+
+            template<>
+            struct ip_alternative<0>
+            {
+                using type = ipv4_address_t;
+            };
+
+            template<>
+            struct ip_alternative<1>
+            {
+                using type = ipv6_address_t;
+            };
+
+            struct ip_address_access;
+        }
+
+        // 可以存放 IPv4 或 IPv6 地址的联合体，ip_version() 返回 4 或 6
+        class ip_address
+        {
+            union storage_t
+            {
+                ipv4_address_t v4;
+                ipv6_address_t v6;
+
+                constexpr storage_t()noexcept : v4{}
+                {
+                }
+                constexpr storage_t(ipv4_address_t value)noexcept : v4(value)
+                {
+                }
+                constexpr storage_t(ipv6_address_t value)noexcept : v6(value)
+                {
+                }
+            };
+
+            storage_t storage_;
+            unsigned char version_;
+
+            friend struct detail::ip_address_access;
+
+        public:
+            constexpr ip_address()noexcept : storage_{}, version_(4)
+            {
+            }
+            constexpr ip_address(ipv4_address_t value)noexcept : storage_(value), version_(4)
+            {
+            }
+            constexpr ip_address(ipv6_address_t value)noexcept : storage_(value), version_(6)
+            {
+            }
+            constexpr ip_address(std::string_view str);
+
+            constexpr int ip_version()const noexcept
+            {
+                return version_;
+            }
+
+            // 与 std::variant 一致：IPv4 是 0，IPv6 是 1
+            constexpr size_t index()const noexcept
+            {
+                return is_ipv4() ? 0 : 1;
+            }
+
+            constexpr bool is_ipv4()const noexcept
+            {
+                return version_ == 4;
+            }
+
+            constexpr bool is_ipv6()const noexcept
+            {
+                return version_ == 6;
+            }
+
+            constexpr ipv4_address_t as_ipv4()const
+            {
+                if (!is_ipv4())
+                {
+                    throw std::invalid_argument{ "not an IPv4 address" };
+                }
+                return storage_.v4;
+            }
+
+            constexpr ipv6_address_t as_ipv6()const
+            {
+                if (!is_ipv6())
+                {
+                    throw std::invalid_argument{ "not an IPv6 address" };
+                }
+                return storage_.v6;
+            }
+
+            template<size_t I, class... Args>
+            constexpr typename detail::ip_alternative<I>::type& emplace(Args&&... args)
+            {
+                using alternative = typename detail::ip_alternative<I>::type;
+                // 先构造临时对象：构造失败时保持原值不变
+                alternative value(std::forward<Args>(args)...);
+                if constexpr (I == 0)
+                {
+                    std::construct_at(&storage_.v4, value);
+                    version_ = 4;
+                    return storage_.v4;
+                }
+                else
+                {
+                    std::construct_at(&storage_.v6, value);
+                    version_ = 6;
+                    return storage_.v6;
+                }
+            }
+
+            template<class T, class... Args>
+            constexpr T& emplace(Args&&... args)
+            {
+                static_assert(std::is_same_v<T, ipv4_address_t> || std::is_same_v<T, ipv6_address_t>,
+                    "T must be ipv4_address_t or ipv6_address_t");
+                if constexpr (std::is_same_v<T, ipv4_address_t>)
+                {
+                    return emplace<0>(std::forward<Args>(args)...);
+                }
+                else
+                {
+                    return emplace<1>(std::forward<Args>(args)...);
+                }
+            }
+
+            constexpr ip_address& operator=(ipv4_address_t value)noexcept
+            {
+                *this = ip_address{ value };
+                return *this;
+            }
+
+            constexpr ip_address& operator=(ipv6_address_t value)noexcept
+            {
+                *this = ip_address{ value };
+                return *this;
+            }
+
+            constexpr explicit operator bool()const noexcept
+            {
+                return is_ipv4() ? (bool)storage_.v4 : (bool)storage_.v6;
+            }
+
+            constexpr bool operator==(const ip_address& other)const noexcept
+            {
+                if (version_ != other.version_)
+                {
+                    return false;
+                }
+                return is_ipv4() ? storage_.v4 == other.storage_.v4 : storage_.v6 == other.storage_.v6;
+            }
+
+            friend constexpr auto operator<=>(const ip_address& l, const ip_address& r)noexcept
+            {
+                if (l.version_ != r.version_)
+                {
+                    return l.version_ <=> r.version_;
+                }
+                if (l.is_ipv4())
+                {
+                    return l.storage_.v4 <=> r.storage_.v4;
+                }
+                return l.storage_.v6 <=> r.storage_.v6;
+            }
+
+            template<class Visitor>
+            constexpr decltype(auto) visit(Visitor&& vis) &
+            {
+                if (is_ipv4())
+                {
+                    return std::invoke(std::forward<Visitor>(vis), storage_.v4);
+                }
+                return std::invoke(std::forward<Visitor>(vis), storage_.v6);
+            }
+
+            template<class Visitor>
+            constexpr decltype(auto) visit(Visitor&& vis) const&
+            {
+                if (is_ipv4())
+                {
+                    return std::invoke(std::forward<Visitor>(vis), storage_.v4);
+                }
+                return std::invoke(std::forward<Visitor>(vis), storage_.v6);
+            }
+
+            template<class Visitor>
+            constexpr decltype(auto) visit(Visitor&& vis) &&
+            {
+                if (is_ipv4())
+                {
+                    return std::invoke(std::forward<Visitor>(vis), std::move(storage_.v4));
+                }
+                return std::invoke(std::forward<Visitor>(vis), std::move(storage_.v6));
+            }
+
+            template<class Visitor>
+            constexpr decltype(auto) visit(Visitor&& vis) const&&
+            {
+                if (is_ipv4())
+                {
+                    return std::invoke(std::forward<Visitor>(vis), std::move(storage_.v4));
+                }
+                return std::invoke(std::forward<Visitor>(vis), std::move(storage_.v6));
+            }
+        };
+
+        namespace detail
+        {
+            struct ip_address_access
+            {
+                static constexpr ipv4_address_t& v4(ip_address& value)noexcept
+                {
+                    return value.storage_.v4;
+                }
+
+                static constexpr const ipv4_address_t& v4(const ip_address& value)noexcept
+                {
+                    return value.storage_.v4;
+                }
+
+                static constexpr ipv6_address_t& v6(ip_address& value)noexcept
+                {
+                    return value.storage_.v6;
+                }
+
+                static constexpr const ipv6_address_t& v6(const ip_address& value)noexcept
+                {
+                    return value.storage_.v6;
+                }
+            };
+        }
+
+        template<size_t I>
+        constexpr typename detail::ip_alternative<I>::type& get(ip_address& value)
+        {
+            if (value.index() != I)
+            {
+                throw std::bad_variant_access{};
+            }
+            if constexpr (I == 0)
+            {
+                return detail::ip_address_access::v4(value);
+            }
+            else
+            {
+                return detail::ip_address_access::v6(value);
+            }
+        }
+
+        template<size_t I>
+        constexpr const typename detail::ip_alternative<I>::type& get(const ip_address& value)
+        {
+            if (value.index() != I)
+            {
+                throw std::bad_variant_access{};
+            }
+            if constexpr (I == 0)
+            {
+                return detail::ip_address_access::v4(value);
+            }
+            else
+            {
+                return detail::ip_address_access::v6(value);
+            }
+        }
+
+        template<size_t I>
+        constexpr typename detail::ip_alternative<I>::type&& get(ip_address&& value)
+        {
+            return std::move(get<I>(value));
+        }
+
+        template<size_t I>
+        constexpr const typename detail::ip_alternative<I>::type&& get(const ip_address&& value)
+        {
+            return std::move(get<I>(value));
+        }
+
+        template<class T>
+        constexpr T& get(ip_address& value)
+        {
+            static_assert(std::is_same_v<T, ipv4_address_t> || std::is_same_v<T, ipv6_address_t>,
+                "T must be ipv4_address_t or ipv6_address_t");
+            if constexpr (std::is_same_v<T, ipv4_address_t>)
+            {
+                return get<0>(value);
+            }
+            else
+            {
+                return get<1>(value);
+            }
+        }
+
+        template<class T>
+        constexpr const T& get(const ip_address& value)
+        {
+            static_assert(std::is_same_v<T, ipv4_address_t> || std::is_same_v<T, ipv6_address_t>,
+                "T must be ipv4_address_t or ipv6_address_t");
+            if constexpr (std::is_same_v<T, ipv4_address_t>)
+            {
+                return get<0>(value);
+            }
+            else
+            {
+                return get<1>(value);
+            }
+        }
+
+        template<class T>
+        constexpr T&& get(ip_address&& value)
+        {
+            static_assert(std::is_same_v<T, ipv4_address_t> || std::is_same_v<T, ipv6_address_t>,
+                "T must be ipv4_address_t or ipv6_address_t");
+            if constexpr (std::is_same_v<T, ipv4_address_t>)
+            {
+                return std::move(get<0>(value));
+            }
+            else
+            {
+                return std::move(get<1>(value));
+            }
+        }
+
+        template<class T>
+        constexpr const T&& get(const ip_address&& value)
+        {
+            static_assert(std::is_same_v<T, ipv4_address_t> || std::is_same_v<T, ipv6_address_t>,
+                "T must be ipv4_address_t or ipv6_address_t");
+            if constexpr (std::is_same_v<T, ipv4_address_t>)
+            {
+                return std::move(get<0>(value));
+            }
+            else
+            {
+                return std::move(get<1>(value));
+            }
+        }
+
+        template<size_t I>
+        constexpr typename detail::ip_alternative<I>::type* get_if(ip_address* value)noexcept
+        {
+            if (value == nullptr || value->index() != I)
+            {
+                return nullptr;
+            }
+            if constexpr (I == 0)
+            {
+                return &detail::ip_address_access::v4(*value);
+            }
+            else
+            {
+                return &detail::ip_address_access::v6(*value);
+            }
+        }
+
+        template<size_t I>
+        constexpr const typename detail::ip_alternative<I>::type* get_if(const ip_address* value)noexcept
+        {
+            if (value == nullptr || value->index() != I)
+            {
+                return nullptr;
+            }
+            if constexpr (I == 0)
+            {
+                return &detail::ip_address_access::v4(*value);
+            }
+            else
+            {
+                return &detail::ip_address_access::v6(*value);
+            }
+        }
+
+        template<class T>
+        constexpr T* get_if(ip_address* value)noexcept
+        {
+            static_assert(std::is_same_v<T, ipv4_address_t> || std::is_same_v<T, ipv6_address_t>,
+                "T must be ipv4_address_t or ipv6_address_t");
+            if constexpr (std::is_same_v<T, ipv4_address_t>)
+            {
+                return get_if<0>(value);
+            }
+            else
+            {
+                return get_if<1>(value);
+            }
+        }
+
+        template<class T>
+        constexpr const T* get_if(const ip_address* value)noexcept
+        {
+            static_assert(std::is_same_v<T, ipv4_address_t> || std::is_same_v<T, ipv6_address_t>,
+                "T must be ipv4_address_t or ipv6_address_t");
+            if constexpr (std::is_same_v<T, ipv4_address_t>)
+            {
+                return get_if<0>(value);
+            }
+            else
+            {
+                return get_if<1>(value);
+            }
+        }
+
+        template<class T>
+        constexpr bool holds_alternative(const ip_address& value)noexcept
+        {
+            static_assert(std::is_same_v<T, ipv4_address_t> || std::is_same_v<T, ipv6_address_t>,
+                "T must be ipv4_address_t or ipv6_address_t");
+            if constexpr (std::is_same_v<T, ipv4_address_t>)
+            {
+                return value.is_ipv4();
+            }
+            else
+            {
+                return value.is_ipv6();
+            }
+        }
+
+        // 非成员 visit，ip_address 所在命名空间，可通过 ADL 调用
+        template<class Visitor>
+        constexpr decltype(auto) visit(Visitor&& vis, ip_address& value)
+        {
+            return value.visit(std::forward<Visitor>(vis));
+        }
+
+        template<class Visitor>
+        constexpr decltype(auto) visit(Visitor&& vis, const ip_address& value)
+        {
+            return value.visit(std::forward<Visitor>(vis));
+        }
+
+        template<class Visitor>
+        constexpr decltype(auto) visit(Visitor&& vis, ip_address&& value)
+        {
+            return std::move(value).visit(std::forward<Visitor>(vis));
+        }
+
+        template<class Visitor>
+        constexpr decltype(auto) visit(Visitor&& vis, const ip_address&& value)
+        {
+            return std::move(value).visit(std::forward<Visitor>(vis));
+        }
+
+        constexpr std::from_chars_result from_chars(const char* first, const char* last, ip_address& value)noexcept
+        {
+            if (first == last)
+            {
+                return { first, std::errc::invalid_argument };
+            }
+            if (*first == '[')
+            {
+                const char* close = std::find(first + 1, last, ']');
+                if (close == last)
+                {
+                    return { first, std::errc::invalid_argument };
+                }
+                ipv6_address_t addr{};
+                auto r = net::from_chars(first + 1, close, addr);
+                if (r.ec != std::errc{} || r.ptr != close)
+                {
+                    return { first, std::errc::invalid_argument };
+                }
+                value = ip_address{ addr };
+                return { close + 1, {} };
+            }
+            if (std::find(first, last, ':') != last)
+            {
+                ipv6_address_t addr{};
+                auto r = net::from_chars(first, last, addr);
+                if (r.ec != std::errc{})
+                {
+                    return { first, std::errc::invalid_argument };
+                }
+                value = ip_address{ addr };
+                return { r.ptr, {} };
+            }
+            ipv4_address_t addr{};
+            auto r = net::from_chars(first, last, addr);
+            if (r.ec != std::errc{})
+            {
+                return { first, std::errc::invalid_argument };
+            }
+            value = ip_address{ addr };
+            return { r.ptr, {} };
+        }
+
+        constexpr std::to_chars_result to_chars(char* first, char* last, ip_address value)noexcept
+        {
+            if (value.is_ipv4())
+            {
+                return net::to_chars(first, last, value.as_ipv4());
+            }
+            return net::to_chars(first, last, value.as_ipv6());
+        }
+
+        constexpr ip_address::ip_address(std::string_view str) : storage_{}, version_(4)
+        {
+            auto r = from_chars(str.data(), str.data() + str.size(), *this);
+            if (r.ec != std::errc{} || r.ptr != str.data() + str.size())
+            {
+                throw std::invalid_argument{ "parse ip address str failed!" };
+            }
+        }
+
+        inline std::ostream& operator<<(std::ostream& os, ip_address value)
+        {
+            char buffer[48]{};
+            to_chars(buffer, buffer + sizeof(buffer), value);
+            return os << buffer;
         }
     }
 
@@ -1585,5 +2317,94 @@ struct std::formatter<Yc::net::ipv6_address_t, char>
         char* first = Yc::net::to_chars(buffer, buffer + 64, ip).ptr;
         return std::copy(buffer, first, ctx.out());
     }
+};
+
+template<>
+struct std::formatter<Yc::net::ipv4_endpoint, char>
+{
+    template<class ParseContext>
+    constexpr ParseContext::iterator parse(ParseContext& ctx)
+    {
+        auto it = ctx.begin();
+        auto ed = ctx.end();
+        if (it == ed || *it == '}')
+        {
+            return it;
+        }
+        throw std::format_error("");
+    }
+
+    template<class FmtContext>
+    constexpr FmtContext::iterator format(Yc::net::ipv4_endpoint ep, FmtContext& ctx) const
+    {
+        char buffer[24]{};
+        char* first = Yc::net::to_chars(buffer, buffer + 24, ep).ptr;
+        return std::copy(buffer, first, ctx.out());
+    }
+};
+
+template<>
+struct std::formatter<Yc::net::ipv6_endpoint, char>
+{
+    template<class ParseContext>
+    constexpr ParseContext::iterator parse(ParseContext& ctx)
+    {
+        auto it = ctx.begin();
+        auto ed = ctx.end();
+        if (it == ed || *it == '}')
+        {
+            return it;
+        }
+        throw std::format_error("");
+    }
+
+    template<class FmtContext>
+    constexpr FmtContext::iterator format(Yc::net::ipv6_endpoint ep, FmtContext& ctx) const
+    {
+        char buffer[48]{};
+        char* first = Yc::net::to_chars(buffer, buffer + 48, ep).ptr;
+        return std::copy(buffer, first, ctx.out());
+    }
+};
+
+template<>
+struct std::formatter<Yc::net::ip_address, char>
+{
+    template<class ParseContext>
+    constexpr ParseContext::iterator parse(ParseContext& ctx)
+    {
+        auto it = ctx.begin();
+        auto ed = ctx.end();
+        if (it == ed || *it == '}')
+        {
+            return it;
+        }
+        throw std::format_error("");
+    }
+
+    template<class FmtContext>
+    constexpr FmtContext::iterator format(Yc::net::ip_address ip, FmtContext& ctx) const
+    {
+        char buffer[64]{};
+        char* first = Yc::net::to_chars(buffer, buffer + 64, ip).ptr;
+        return std::copy(buffer, first, ctx.out());
+    }
+};
+
+template<>
+struct std::variant_size<Yc::net::ip_address> : std::integral_constant<std::size_t, 2>
+{
+};
+
+template<>
+struct std::variant_alternative<0, Yc::net::ip_address>
+{
+    using type = Yc::net::ipv4_address_t;
+};
+
+template<>
+struct std::variant_alternative<1, Yc::net::ip_address>
+{
+    using type = Yc::net::ipv6_address_t;
 };
 
